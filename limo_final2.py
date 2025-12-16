@@ -1,186 +1,235 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import rospy
 import cv2
 import numpy as np
 
-from sensor_msgs.msg import Image, LaserScan
+from sensor_msgs.msg import CompressedImage, LaserScan
 from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
 
 
-class MissionLaneController:
+class LineTracerWithObstacleAvoidance:
     def __init__(self):
-        rospy.init_node("mission_lane_controller")
+        rospy.init_node("line_tracer_with_obstacle_avoidance")
 
-        rospy.Subscriber("/usb_cam/image_raw", Image, self.image_cb, queue_size=1)
-        rospy.Subscriber("/scan", LaserScan, self.lidar_cb, queue_size=1)
         self.pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+        rospy.Subscriber("/usb_cam/image_raw/compressed",
+                         CompressedImage, self.camera_cb)
+        rospy.Subscriber("/scan", LaserScan, self.lidar_cb)
 
-        # ================= 상태 =================
-        self.mode = "LANE"   # LANE / OBSTACLE / CONE
-        self.state = "LANE"  # LANE / BACK / ESCAPE
-        self.state_start = rospy.Time.now().to_sec()
+        self.bridge = CvBridge()
 
-        # ================= 라이다 =================
-        self.scan = []
-        self.front = 999.0
-        self.left = 999.0
-        self.right = 999.0
+        # =====================
+        # Parameters
+        # =====================
+        self.speed = 0.24
         self.robot_width = 0.13
+
+        self.scan_ranges = []
+        self.front = 999.0
+
+        # FSM
+        self.state = "LANE"
+        self.state_start = rospy.Time.now().to_sec()
         self.escape_angle = 0.0
 
-        # ================= 카메라 =================
-        self.encoding = None
-
-        # ================= 파라미터 =================
-        self.lane_speed = 0.24
-
-        rospy.loginfo("Mission Lane Controller STARTED")
+        # Escape direction logic
+        self.left_escape_count = 0
+        self.force_right_escape = 0
 
     # ============================================================
     # LIDAR CALLBACK
     # ============================================================
     def lidar_cb(self, scan):
         raw = np.array(scan.ranges)
-        self.scan = raw
+        self.scan_ranges = raw
 
-        # 정면
+        # 정면 ±10도
         front_zone = np.concatenate([raw[:10], raw[-10:]])
-        front_valid = [d for d in front_zone if d > 0.20 and not np.isnan(d)]
-        self.front = min(front_valid) if front_valid else 999.0
-
-        # 좌우 (라바콘)
-        left_zone = raw[60:90]
-        right_zone = raw[270:300]
-
-        left_valid = [d for d in left_zone if d > 0.20 and not np.isnan(d)]
-        right_valid = [d for d in right_zone if d > 0.20 and not np.isnan(d)]
-
-        self.left = np.mean(left_valid) if left_valid else 999.0
-        self.right = np.mean(right_valid) if right_valid else 999.0
+        cleaned = [d for d in front_zone if d > 0.20 and not np.isnan(d)]
+        self.front = np.median(cleaned) if cleaned else 999.0
 
     # ============================================================
-    # IMAGE CALLBACK
+    # CAMERA CALLBACK
     # ============================================================
-    def image_cb(self, msg):
+    def camera_cb(self, msg):
         now = rospy.Time.now().to_sec()
-        twist = Twist()
 
-        # ================= 미션 자동 판단 (A) =================
-        if self.front < 0.45:
-            self.mode = "OBSTACLE"
-        elif abs(self.left - self.right) > 0.35:
-            self.mode = "CONE"
-        else:
-            self.mode = "LANE"
-
-        # ================= 미션 #3 장애물 =================
-        if self.mode == "OBSTACLE":
-            self.obstacle_control(twist, now)
-            self.pub.publish(twist)
+        if self.state == "ESCAPE":
+            self.escape_control()
             return
-
-        # ================= 미션 #4 라바콘 =================
-        if self.mode == "CONE":
-            self.cone_control(twist)
-            self.pub.publish(twist)
-            return
-
-        # ================= 기본 라인트레이싱 =================
-        self.lane_control(msg, twist)
-        self.pub.publish(twist)
-
-    # ============================================================
-    # LANE CONTROL (원본 유지)
-    # ============================================================
-    def lane_control(self, msg, twist):
-        if self.encoding is None:
-            self.encoding = msg.encoding
-
-        h, w = msg.height, msg.width
-        img = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, msg.step // 3, 3)[:, :w]
-        if self.encoding == "rgb8":
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-        roi = img[int(h * 0.5):, :]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-        _, binary = cv2.threshold(
-            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )
-
-        col_sum = np.sum(binary > 0, axis=0)
-        max_val = np.max(col_sum) if col_sum.size > 0 else 0
-
-        if max_val < 5:
-            twist.linear.x = 0.12
-            twist.angular.z = 0.25
-            return
-
-        idx = np.where(col_sum >= max_val * 0.3)[0]
-        if idx.size == 0:
-            twist.linear.x = 0.12
-            twist.angular.z = 0.25
-            return
-
-        track_center = np.mean(idx)
-        offset = track_center - (w / 2.0)
-
-        twist.linear.x = self.lane_speed
-        twist.angular.z = -0.008 * offset
-
-    # ============================================================
-    # OBSTACLE CONTROL (미션 #3)
-    # ============================================================
-    def obstacle_control(self, twist, now):
-        if self.state == "LANE":
-            self.state = "BACK"
-            self.state_start = now
 
         if self.state == "BACK":
-            if now - self.state_start < 1.3:
-                twist.linear.x = -0.24
-                twist.angular.z = 0.0
-            else:
-                self.escape_angle = self.find_gap_max()
-                if abs(self.escape_angle) < 0.15:
-                    self.escape_angle = 0.6
-                self.state = "ESCAPE"
-                self.state_start = now
+            self.back_control()
+            return
 
-        elif self.state == "ESCAPE":
-            if now - self.state_start < 1.0:
-                twist.linear.x = 0.20
-                twist.angular.z = self.escape_angle
-            else:
-                self.state = "LANE"
+        twist = Twist()
+
+        # =====================
+        # LANE MODE
+        # =====================
+        if self.front < 0.45:
+            self.state = "BACK"
+            self.state_start = now
+            return
+
+        frame = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
+        h, w = frame.shape[:2]
+
+        # ROI
+        roi_near = frame[int(h * 0.55):h, :]
+        roi_mid = frame[int(h * 0.35):int(h * 0.55), :]
+
+        hsv_near = cv2.cvtColor(roi_near, cv2.COLOR_BGR2HSV)
+        hsv_mid = cv2.cvtColor(roi_mid, cv2.COLOR_BGR2HSV)
+
+        # =====================
+        # White lane mask
+        # =====================
+        lower_white = np.array([0, 0, 180])
+        upper_white = np.array([180, 40, 255])
+
+        mask_near = cv2.inRange(hsv_near, lower_white, upper_white)
+        mask_mid = cv2.inRange(hsv_mid, lower_white, upper_white)
+
+        contours_near, _ = cv2.findContours(
+            mask_near, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+        # =====================
+        # Cone (red) detection
+        # =====================
+        lower_r1 = np.array([0, 120, 80])
+        upper_r1 = np.array([10, 255, 255])
+        lower_r2 = np.array([170, 120, 80])
+        upper_r2 = np.array([180, 255, 255])
+
+        mask_r = cv2.bitwise_or(
+            cv2.inRange(hsv_near, lower_r1, upper_r1),
+            cv2.inRange(hsv_near, lower_r2, upper_r2)
+        )
+
+        red_contours, _ = cv2.findContours(
+            mask_r, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if len(red_contours) >= 1:
+            centers = []
+            for cnt in red_contours:
+                if cv2.contourArea(cnt) < 200:
+                    continue
+                M = cv2.moments(cnt)
+                if M["m00"] == 0:
+                    continue
+                centers.append(int(M["m10"] / M["m00"]))
+
+            if centers:
+                mid = (min(centers) + max(centers)) // 2
+                error = mid - (w // 2)
+
+                twist.linear.x = 0.21
+                twist.angular.z = error / 180.0
+                self.pub.publish(twist)
+                return
+
+        # =====================
+        # Recovery logic
+        # =====================
+        if len(contours_near) == 0 and cv2.countNonZero(mask_mid) > 250:
+            twist.linear.x = 0.12
+            twist.angular.z = -0.55
+            self.pub.publish(twist)
+            return
+
+        if len(contours_near) == 0:
+            twist.linear.x = 0.10
+            twist.angular.z = 0.25
+            self.pub.publish(twist)
+            return
+
+        # =====================
+        # Normal lane tracing
+        # =====================
+        c = max(contours_near, key=cv2.contourArea)
+        M = cv2.moments(c)
+
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            error = cx - (w // 2)
+
+            twist.linear.x = 0.22
+            twist.angular.z = error / 200.0
+            self.pub.publish(twist)
 
     # ============================================================
-    # CONE CONTROL (미션 #4, 라이다)
+    # BACK MODE
     # ============================================================
-    def cone_control(self, twist):
-        error = self.right - self.left
-        twist.linear.x = 0.20
-        twist.angular.z = error * 0.8
+    def back_control(self):
+        twist = Twist()
+        now = rospy.Time.now().to_sec()
+
+        if now - self.state_start < 1.4:
+            twist.linear.x = -0.24
+            self.pub.publish(twist)
+        else:
+            angle = self.find_gap_max()
+            angle = self.apply_escape_direction_logic(angle)
+
+            self.escape_angle = angle
+            self.state = "ESCAPE"
+            self.state_start = now
 
     # ============================================================
-    # GAP FINDER
+    # ESCAPE MODE
+    # ============================================================
+    def escape_control(self):
+        twist = Twist()
+        now = rospy.Time.now().to_sec()
+
+        if now - self.state_start < 1.0:
+            twist.linear.x = 0.19
+            twist.angular.z = self.escape_angle * 1.3
+            self.pub.publish(twist)
+        else:
+            self.state = "LANE"
+
+    # ============================================================
+    # Escape direction logic
+    # ============================================================
+    def apply_escape_direction_logic(self, angle):
+        if self.force_right_escape > 0:
+            self.force_right_escape -= 1
+            return 0.9
+
+        if angle < 0:
+            self.left_escape_count += 1
+            if self.left_escape_count >= 4:
+                self.force_right_escape = 2
+                self.left_escape_count = 0
+        else:
+            self.left_escape_count = 0
+
+        return angle
+
+    # ============================================================
+    # Gap finder
     # ============================================================
     def find_gap_max(self):
-        if len(self.scan) == 0:
+        if len(self.scan_ranges) == 0:
             return 0.0
 
-        ranges = np.concatenate([self.scan[-60:], self.scan[:60]])
+        raw = np.array(self.scan_ranges)
+        ranges = np.concatenate([raw[-60:], raw[:60]])
         ranges = np.where((ranges < 0.20) | np.isnan(ranges), 0.0, ranges)
 
         idx = np.argmax(ranges)
         if ranges[idx] < (self.robot_width + 0.10):
             return 0.0
 
-        return (idx - 60) * np.pi / 180.0
+        angle_deg = idx - 60
+        return angle_deg * np.pi / 180.0
 
 
 if __name__ == "__main__":
-    MissionLaneController()
+    LineTracerWithObstacleAvoidance()
     rospy.spin()
+
+
