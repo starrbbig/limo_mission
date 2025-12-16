@@ -11,6 +11,7 @@ class EdgeLaneNoBridge:
     def __init__(self):
         rospy.init_node("edge_lane_nobridge_node")
 
+        # Subscriber & Publisher
         rospy.Subscriber("/usb_cam/image_raw", Image, self.image_callback, queue_size=1)
         rospy.Subscriber("/scan", LaserScan, self.lidar_callback, queue_size=1)
         self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=3)
@@ -25,61 +26,60 @@ class EdgeLaneNoBridge:
         self.search_spin_speed = 0.25 
         self.k_angle = 0.010 
 
-        # ===== [상태 제어 변수] =====
+        # ===== [상태 제어 변수 수정] =====
+        # LANE -> BACK -> ESCAPE_TURN -> ESCAPE_STRAIGHT 순서로 동작
         self.state = "LANE"
         self.state_start = 0.0
         self.front_dist = 999.0
         self.scan_ranges = []
         self.escape_angle = 0.0
 
-        rospy.loginfo("🚀 장애물 회피 최종 최적화 버전 시작")
+        rospy.loginfo("🚀 장애물 회피 강화 버전(2단계 탈출) 시작")
 
     def lidar_callback(self, scan):
         self.scan_ranges = np.array(scan.ranges)
-        # 감지 범위를 정면 좁게 설정하여 옆 장애물에 간섭받지 않게 함
-        front_indices = np.concatenate([self.scan_ranges[:10], self.scan_ranges[-10:]])
+        front_indices = np.concatenate([self.scan_ranges[:15], self.scan_ranges[-15:]])
         cleaned = [d for d in front_indices if d > 0.15 and not np.isnan(d)]
         self.front_dist = np.median(cleaned) if cleaned else 999.0
 
     def image_callback(self, msg: Image):
         now = rospy.Time.now().to_sec()
 
-        # [1. 장애물 회피 로직]
+        # [1. 장애물 회피 로직 - 강화됨]
         
-        # 후진
+        # 1-1. 후진
         if self.state == "BACK":
-            if now - self.state_start < 1.3:
+            if now - self.state_start < 1.3: # 후진 시간 약간 늘림
                 self.current_lin = -0.15
                 self.current_ang = 0.0
             else:
                 self.current_lin = 0.0
                 self.escape_angle = self.find_best_gap()
-                self.state = "ESCAPE_TURN"
+                self.state = "ESCAPE_TURN" # 바로 안 나가고 '회전'부터 함
                 self.state_start = now
             return
 
-        # 제자리 회전 (빈 공간 정확히 조준)
+        # 1-2. 제자리 회전 (장애물 없는 쪽으로 고개 돌리기)
         if self.state == "ESCAPE_TURN":
-            if now - self.state_start < 1.0:
+            if now - self.state_start < 1.0: # 1초간 제자리 회전
                 self.current_lin = 0.0
+                # 각도 배율을 높여 더 확실하게 꺾음
                 self.current_ang = np.clip(self.escape_angle * 2.5, -1.2, 1.2)
             else:
-                self.state = "ESCAPE_STRAIGHT"
+                self.state = "ESCAPE_STRAIGHT" # 이제 앞으로 나감
                 self.state_start = now
             return
 
-        # [핵심 수정] 탈출 직진 유지 (장애물을 완전히 지나칠 때까지 차선 인식 차단)
+        # 1-3. 전방 주행 (장애물 옆 통과하기)
         if self.state == "ESCAPE_STRAIGHT":
-            # 2.0초로 연장하여 장애물 영향권을 확실히 벗어남
-            if now - self.state_start < 2.0:
+            if now - self.state_start < 1.2: # 1.2초간 장애물 옆을 지나침
                 self.current_lin = 0.12
-                self.current_ang = 0.0 # 조향 개입 차단 (똑바로 가기)
+                self.current_ang = 0.0 # 직진해서 옆구리 안 걸리게 함
             else:
                 self.state = "LANE"
-                rospy.loginfo("🏁 탈출 완료, 차선 추종 복귀")
             return
 
-        # [감지] 정면 장애물 발견 시 회피 시작
+        # [감지] 
         if self.front_dist < 0.45:
             self.state = "BACK"
             self.state_start = now
@@ -130,12 +130,16 @@ class EdgeLaneNoBridge:
         ranges = np.concatenate([raw[-90:], raw[:90]])
         ranges = np.nan_to_num(ranges, nan=0.0, posinf=3.5, neginf=0.0)
         
-        window_size = 35 # 틈새를 더 엄격하게 필터링
+        # 윈도우 사이즈를 늘려(30) 더 넓은 공간을 찾게 함
+        window_size = 30 
         smoothed = np.convolve(ranges, np.ones(window_size)/window_size, mode='same')
         
         best_idx = np.argmax(smoothed)
+        # 선택된 각도에서 바깥쪽으로 5도 정도 더 여유를 줌 (장애물에서 멀어지게)
         angle_deg = (best_idx - 90)
-        # 안전 여유를 더 늘려 장애물 사이 정중앙을 정확히 찌르게 함
+        if angle_deg > 0: angle_deg += 5
+        else: angle_deg -= 5
+            
         return angle_deg * (np.pi / 180.0)
 
     def msg_to_cv2(self, msg):
