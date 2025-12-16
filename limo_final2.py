@@ -18,17 +18,17 @@ class LimoFinalController:
 
         self.cmd = Twist()
 
-        # FSM
-        self.state = "LANE"   # LANE / BACK / ESCAPE
+        # ================= FSM =================
+        self.state = "LANE"      # LANE / BACK / ESCAPE
         self.state_start = rospy.Time.now().to_sec()
 
-        # Lane
-        self.forward_speed = 0.12
-        self.search_spin_speed = 0.25
+        # ================= LANE =================
+        self.forward_speed = 0.24        # ★ 2배 속도
+        self.search_spin_speed = 0.30
         self.k_angle = 0.010
         self.last_lane_dir = 1.0
 
-        # Lidar
+        # ================= LIDAR =================
         self.scan_ranges = []
         self.front = 999.0
         self.robot_width = 0.13
@@ -37,26 +37,26 @@ class LimoFinalController:
         self.left_escape_count = 0
         self.force_right_escape = 0
 
-        # Cmd
+        # ================= CMD =================
         self.current_lin = 0.0
         self.current_ang = 0.0
 
         self.encoding = None
 
-        rospy.loginfo("✅ LIMO FINAL CONTROLLER (Box-safe version)")
+        rospy.loginfo("✅ LIMO FINAL CONTROLLER : ZERO FINAL VERSION")
 
     # ============================================================
-    # LIDAR (긁힘 방지 핵심 수정)
+    # LIDAR CALLBACK  (긁힘 + 조기 감지)
     # ============================================================
     def lidar_cb(self, scan):
         raw = np.array(scan.ranges)
         self.scan_ranges = raw
 
-        # 정면 ±30도 (기존보다 넓게)
+        # 정면 ±30도
         front_zone = np.concatenate([raw[:18], raw[-18:]])
         cleaned = [d for d in front_zone if d > 0.20 and not np.isnan(d)]
 
-        # 모서리 조기 감지용
+        # 모서리 기준 판단
         self.front = min(cleaned) if cleaned else 999.0
 
     # ============================================================
@@ -67,11 +67,12 @@ class LimoFinalController:
             self.encoding = msg.encoding
 
         h, w = msg.height, msg.width
-
         arr = np.frombuffer(msg.data, dtype=np.uint8)
         img = arr.reshape(h, msg.step // 3, 3)[:, :w]
+
         if self.encoding == "rgb8":
             img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
         return img
 
     # ============================================================
@@ -80,18 +81,20 @@ class LimoFinalController:
     def image_cb(self, msg):
         now = rospy.Time.now().to_sec()
 
+        # ---------- ESCAPE ----------
         if self.state == "ESCAPE":
             self.escape_control()
             return
 
+        # ---------- BACK ----------
         if self.state == "BACK":
             self.back_control()
             return
 
-        # ---------- 사전 감속 (긁힘 방지 핵심) ----------
+        # ---------- 사전 감속 (조향 간섭 X) ----------
         if self.front < 0.60:
-            self.current_lin = 0.05
-            self.current_ang = 0.0
+            self.current_lin = 0.12   # 절반 속도만
+            # 조향은 건드리지 않음
 
         # ---------- BACK 진입 ----------
         if self.front < 0.45:
@@ -113,7 +116,7 @@ class LimoFinalController:
         self.edge_lane_control(img)
 
     # ============================================================
-    # CONE (2nd code)
+    # CONE (두 번째 코드 방식)
     # ============================================================
     def cone_control(self, img):
         h, w = img.shape[:2]
@@ -144,12 +147,12 @@ class LimoFinalController:
         mid = (min(centers) + max(centers)) // 2
         error = mid - (w // 2)
 
-        self.current_lin = 0.21
+        self.current_lin = 0.26
         self.current_ang = error / 180.0
         return True
 
     # ============================================================
-    # EDGE LANE
+    # EDGE LANE (기존 로직 유지)
     # ============================================================
     def edge_lane_control(self, img):
         h, w, _ = img.shape
@@ -168,7 +171,7 @@ class LimoFinalController:
         max_val = np.max(col_sum) if col_sum.size > 0 else 0
 
         if max_val < 5:
-            self.current_lin = 0.10
+            self.current_lin = 0.12
             self.current_ang = self.search_spin_speed * self.last_lane_dir
             return
 
@@ -180,7 +183,7 @@ class LimoFinalController:
         offset = track_center - center
 
         ang = -self.k_angle * offset
-        ang = np.clip(ang, -0.8, 0.8)
+        ang = np.clip(ang, -0.9, 0.9)
 
         if abs(ang) > 0.05:
             self.last_lane_dir = np.sign(ang)
@@ -189,16 +192,21 @@ class LimoFinalController:
         self.current_ang = ang
 
     # ============================================================
-    # BACK / ESCAPE
+    # BACK / ESCAPE (무한루프 제거)
     # ============================================================
     def back_control(self):
         now = rospy.Time.now().to_sec()
 
-        if now - self.state_start < 1.4:
-            self.current_lin = -0.24
+        if now - self.state_start < 1.2:
+            self.current_lin = -0.26
             self.current_ang = 0.0
         else:
             angle = self.find_gap_max()
+
+            # ★ 핵심 : 각도 0 방지
+            if abs(angle) < 0.15:
+                angle = 0.6
+
             angle = self.apply_escape_direction_logic(angle)
 
             self.escape_angle = angle
@@ -209,11 +217,14 @@ class LimoFinalController:
         now = rospy.Time.now().to_sec()
 
         if now - self.state_start < 1.0:
-            self.current_lin = 0.19
+            self.current_lin = 0.22
             self.current_ang = self.escape_angle * 1.3
         else:
             self.state = "LANE"
 
+    # ============================================================
+    # Escape helpers
+    # ============================================================
     def apply_escape_direction_logic(self, angle):
         if self.force_right_escape > 0:
             self.force_right_escape -= 1
@@ -243,6 +254,9 @@ class LimoFinalController:
 
         return (idx - 60) * np.pi / 180.0
 
+    # ============================================================
+    # LOOP
+    # ============================================================
     def spin(self):
         rate = rospy.Rate(20)
         while not rospy.is_shutdown():
