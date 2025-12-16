@@ -45,7 +45,7 @@ class EdgeLaneNoBridge:
 
         # 1. 후진 (짧고 빠르게)
         if self.state == "BACK":
-            if now - self.state_start < 1.3:
+            if now - self.state_start < 0.8:
                 self.current_lin = -0.15
                 self.current_ang = 0.0
             else:
@@ -57,10 +57,10 @@ class EdgeLaneNoBridge:
 
         # 2. 제자리 회전 (비어있는 방향으로 살짝만 고개 돌리기)
         if self.state == "ESCAPE_TURN":
-            if now - self.state_start < 1.2:
+            if now - self.state_start < 0.8:
                 self.current_lin = 0.0
                 # 비어있는 방향으로 확실히 회전
-                self.current_ang = 1.1 * self.escape_dir
+                self.current_ang = 0.8 * self.escape_dir
             else:
                 self.state = "LANE" # 바로 차선 추종으로 복귀하되, 회피 로직이 섞임
             return
