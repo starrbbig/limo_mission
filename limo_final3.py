@@ -9,7 +9,7 @@ from sensor_msgs.msg import Image, LaserScan
 from geometry_msgs.msg import Twist
 
 # ============================================================
-#  FINAL : Edge Lane + Obstacle (2-Step Escape) (LIMO)
+#  FINAL : Edge Lane + Obstacle + Cone (2-Step Escape) (LIMO)
 # ============================================================
 class LimoFinalController:
     def __init__(self):
@@ -43,7 +43,10 @@ class LimoFinalController:
         self.front = 999.0
         self.escape_angle = 0.0
 
-        rospy.loginfo("✅ LIMO FINAL CONTROLLER (2-STEP ESCAPE) STARTED")
+        # ---------------- CONE ----------------
+        self.red_contours = []
+
+        rospy.loginfo("✅ LIMO FINAL CONTROLLER (LANE + CONE + 2-STEP ESCAPE) STARTED")
 
     # ============================================================
     # LIDAR
@@ -57,7 +60,7 @@ class LimoFinalController:
         self.front = np.median(cleaned) if cleaned else 999.0
 
     # ============================================================
-    # IMAGE → CV2
+    # IMAGE → CV2 (rgb8 / bgr8 / mono8 지원)
     # ============================================================
     def msg_to_cv2(self, msg):
         if self.encoding is None:
@@ -72,6 +75,12 @@ class LimoFinalController:
             if self.encoding == "rgb8":
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             return img
+
+        # ===== [추가됨] mono8 처리 =====
+        if self.encoding == "mono8":
+            arr = np.frombuffer(msg.data, dtype=np.uint8)
+            img = arr.reshape(h, msg.step)[:, :w]
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
         return None
 
@@ -96,7 +105,7 @@ class LimoFinalController:
             self.escape_straight_control()
             return
 
-        # ---------- 장애물 감지 ----------
+        # ---------- 장애물 감지 (LiDAR 최우선) ----------
         if self.front < 0.45:
             self.state = "BACK"
             self.state_start = now
@@ -108,11 +117,61 @@ class LimoFinalController:
             self.current_ang = self.search_spin_speed
             return
 
+        # ---------- 라바콘 (LANE 상태에서만) ----------
+        if self.state == "LANE":
+            if self.detect_cone(img):
+                self.cone_control(img)
+                return
+
         # ---------- 기본 라인트레이싱 ----------
         self.edge_lane_control(img)
 
     # ============================================================
-    # EDGE LANE (기존 로직 유지)
+    # CONE
+    # ============================================================
+    def detect_cone(self, img):
+        h, w = img.shape[:2]
+        roi = img[int(h * 0.55):, :]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        lower_r1 = np.array([0, 120, 80])
+        upper_r1 = np.array([10, 255, 255])
+        lower_r2 = np.array([170, 120, 80])
+        upper_r2 = np.array([180, 255, 255])
+
+        mask = cv2.inRange(hsv, lower_r1, upper_r1) | \
+               cv2.inRange(hsv, lower_r2, upper_r2)
+
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        self.red_contours = [c for c in contours if cv2.contourArea(c) > 200]
+        return len(self.red_contours) > 0
+
+    def cone_control(self, img):
+        h, w = img.shape[:2]
+        centers = []
+
+        for c in self.red_contours:
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                centers.append(int(M["m10"] / M["m00"]))
+
+        if not centers:
+            return
+
+        if len(centers) >= 2:
+            mid = (min(centers) + max(centers)) // 2
+        else:
+            mid = centers[0]
+
+        error = mid - (w // 2)
+        self.current_lin = 0.13
+        self.current_ang = error / 180.0
+
+    # ============================================================
+    # EDGE LANE
     # ============================================================
     def edge_lane_control(self, img):
         h, w, _ = img.shape
