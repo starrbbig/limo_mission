@@ -24,8 +24,7 @@ class LimoFinalChecked:
         # ================= LANE PARAM =================
         self.k_angle = 0.010
         self.search_spin_speed = 0.25
-
-        self.forward_speed = 0.22   # ★★★ [속도조절] 기본 라인 속도 ★★★
+        self.forward_speed = 0.22   # ★ [속도조절] 기본 라인 속도
 
         # ================= LIDAR =================
         self.scan_ranges = []
@@ -54,7 +53,7 @@ class LimoFinalChecked:
         self.front = np.median(valid) if valid else 999.0
 
     # ============================================================
-    # IMAGE CALLBACK (SINGLE PUBLISH POINT)
+    # IMAGE CALLBACK (SINGLE PUBLISH)
     # ============================================================
     def image_cb(self, msg):
         now = rospy.Time.now().to_sec()
@@ -117,7 +116,7 @@ class LimoFinalChecked:
         return img
 
     # ============================================================
-    # CONE (친구 코드, 수정 없음)
+    # CONE (친구 코드 유지)
     # ============================================================
     def detect_cone(self, img):
         h, w = img.shape[:2]
@@ -147,12 +146,12 @@ class LimoFinalChecked:
         mid = (min(centers) + max(centers)) // 2
         error = mid - (w // 2)
 
-        lin = 0.21   # ★★★ [속도조절] 라바콘 주행 속도 ★★★
+        lin = 0.21   # ★ [속도조절] 라바콘 주행 속도
         ang = error / 180.0
         return lin, ang
 
     # ============================================================
-    # EDGE LANE (네 코드)
+    # EDGE LANE (중앙 보정 적용)
     # ============================================================
     def edge_lane_control(self, img):
         h, w, _ = img.shape
@@ -177,20 +176,22 @@ class LimoFinalChecked:
             return 0.10, self.search_spin_speed
 
         track_center = np.sum(idx * col_sum[idx]) / np.sum(col_sum[idx])
-        offset = track_center - center
+
+        # ★★★★★ 중앙 보정 (왼쪽 치우침 해결 핵심) ★★★★★
+        offset = (track_center - center) + 5.0
 
         ang = -self.k_angle * offset
         ang = np.clip(ang, -0.8, 0.8)
 
-        lin = self.forward_speed   # ★★★ [속도조절] 기본 라인 속도 ★★★
+        lin = self.forward_speed   # ★ [속도조절] 기본 라인 속도
         return lin, ang
 
     # ============================================================
-    # BACK / ESCAPE (친구 코드, 안정화)
+    # BACK / ESCAPE
     # ============================================================
     def back_control(self, now):
         if now - self.state_start < 1.4:
-            return -0.24, 0.0   # ★★★ [속도조절] 후진 속도 ★★★
+            return -0.24, 0.0   # ★ [속도조절] 후진 속도
         else:
             angle = self.find_gap_max()
             angle = self.apply_escape_direction_logic(angle)
@@ -201,7 +202,7 @@ class LimoFinalChecked:
 
     def escape_control(self, now):
         if now - self.state_start < 1.0:
-            return 0.19, self.escape_angle * 1.3   # ★★★ [속도조절] 탈출 전진 속도 ★★★
+            return 0.19, self.escape_angle * 1.3   # ★ [속도조절] 탈출 전진
         else:
             self.state = "LANE"
             return 0.0, 0.0
