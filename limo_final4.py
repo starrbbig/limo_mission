@@ -47,7 +47,6 @@ class LimoFinalController:
     def lidar_cb(self, scan):
         raw = np.array(scan.ranges)
         self.scan_ranges = raw
-        # 정면 20도 영역 감지 (좌우 10도씩)
         front_zone = np.concatenate([raw[:10], raw[-10:]])
         cleaned = [d for d in front_zone if d > 0.15 and not np.isnan(d)]
         self.front = np.median(cleaned) if cleaned else 999.0
@@ -57,8 +56,7 @@ class LimoFinalController:
     # ============================================================
     def image_cb(self, msg):
         now = rospy.Time.now().to_sec()
-       
-        # [단계 1: 장애물 회피 상태 우선 실행]
+        
         if self.state == "BACK":
             self.back_control(now)
             return
@@ -67,13 +65,11 @@ class LimoFinalController:
             self.escape_control(now)
             return
 
-        # [단계 2: 장애물 감지 트리거]
         if self.front < 0.45:
             self.state = "BACK"
             self.state_start = now
             return
 
-        # [단계 3: 카메라 기반 주행 (라바콘 or 차선)]
         img = self.msg_to_cv2(msg)
         if img is None:
             self.current_lin, self.current_ang = 0.0, self.search_spin_speed
@@ -85,51 +81,38 @@ class LimoFinalController:
             self.edge_lane_control(img)
 
     # ============================================================
-    # BACK / ESCAPE (2단계 곡선 회피로 수정됨)
+    # BACK / ESCAPE
     # ============================================================
     def back_control(self, now):
-        """1단계: 짧게 후진하며 탈출 각도 계산"""
         if now - self.state_start < 1.2:
             self.current_lin = -0.15
             self.current_ang = 0.0
         else:
-            # 후진 끝나는 시점에 가장 뚫린 방향 찾기
             self.escape_angle = self.find_gap_max_forward()
             self.state = "ESCAPE"
             self.state_start = now
 
     def escape_control(self, now):
-        """2단계: 전진과 회전을 동시에 하여 곡선으로 탈출"""
-        if now - self.state_start < 1.5:  # 1.5초간 곡선 주행
+        if now - self.state_start < 1.5:
             self.current_lin = 0.12
-            # 찾은 각도에 가중치를 주어 부드럽게 회전 (배율 1.5~1.8)
             self.current_ang = np.clip(self.escape_angle * 1.5, -0.8, 0.8)
         else:
             self.state = "LANE"
 
     def find_gap_max_forward(self):
-        """전방 120도 안에서 로봇이 지나갈 수 있는 가장 넓은 공간 탐색"""
         if len(self.scan_ranges) == 0: return 0.0
-       
         raw = np.array(self.scan_ranges)
-        # 뒤쪽은 아예 안 봄 (전방 좌우 60도씩 총 120도)
         ranges = np.concatenate([raw[-60:], raw[:60]])
-        # 결측치 및 너무 가까운 거리 처리
         ranges = np.nan_to_num(ranges, nan=0.0, posinf=3.5, neginf=0.0)
-       
-        # 윈도우 평균(Convolution)을 통해 '한 점'이 아닌 '길'을 찾음
         window_size = 20
         smoothed = np.convolve(ranges, np.ones(window_size)/window_size, mode='same')
-       
         best_idx = np.argmax(smoothed)
-        angle_deg = best_idx - 60 # 인덱스를 각도로 변환 (-60 ~ +60)
-       
-        # 장애물로부터 조금 더 안전하게 떨어지기 위한 보정(+/- 5도)
+        angle_deg = best_idx - 60
         safe_margin = 5 if angle_deg > 0 else -5
         return (angle_deg + safe_margin) * np.pi / 180.0
 
     # ============================================================
-    # CONE / LANE (기존 로직 최적화 유지)
+    # CONE CONTROL (업그레이드 버전: 양쪽 탐색 및 사이 주행)
     # ============================================================
     def detect_cone(self, img):
         h, w = img.shape[:2]
@@ -142,26 +125,70 @@ class LimoFinalController:
         return len(self.red_contours) > 0
 
     def cone_control(self, img):
+        """라바콘 박치기 방지 및 사이 주행 로직"""
         h, w = img.shape[:2]
+        # 중심점 좌표 추출
         centers = [int(cv2.moments(c)["m10"]/cv2.moments(c)["m00"]) for c in self.red_contours if cv2.moments(c)["m00"] > 0]
         if not centers: return
-        mid = (min(centers) + max(centers)) // 2 if len(centers) >= 2 else centers[0]
-        error = mid - (w // 2)
-        self.current_lin, self.current_ang = 0.13, np.clip(-error / 180.0, -0.8, 0.8)
 
+        # 거리를 가늠하기 위한 가장 큰 라바콘의 면적
+        max_area = max([cv2.contourArea(c) for c in self.red_contours])
+
+        # [케이스 1] 라바콘이 2개 이상 보일 때 -> 정중앙으로 통과
+        if len(centers) >= 2:
+            left_c = min(centers)
+            right_c = max(centers)
+            mid_target = (left_c + right_c) // 2
+            error = mid_target - (w // 2)
+            
+            self.current_lin = 0.12
+            self.current_ang = np.clip(-error / 150.0, -0.8, 0.8)
+            # rospy.loginfo("🔴🔴 Two Cones: Passing Middle")
+
+        # [케이스 2] 라바콘이 하나만 보일 때 -> 박치기 방지 및 탐색
+        else:
+            cone_x = centers[0]
+            
+            # (A) 거리가 멀 때: 다른 하나를 찾기 위해 살짝 회전 탐색
+            if max_area < 6000:
+                self.current_lin = 0.07 
+                # 라바콘이 왼쪽에 있으면 오른쪽을 더 보려고 시도
+                self.current_ang = 0.25 if cone_x < (w // 2) else -0.25
+                # rospy.loginfo("🔍 One Cone: Searching for the other...")
+            
+            # (B) 거리가 가까울 때: 보이지 않는 반대편 가상 공간으로 피하기
+            else:
+                if cone_x < (w // 2): # 왼쪽 라바콘이면 오른쪽으로 빗겨가기
+                    target_offset = cone_x + (w // 3)
+                else:                 # 오른쪽 라바콘이면 왼쪽으로 빗겨가기
+                    target_offset = cone_x - (w // 3)
+                
+                error = target_offset - (w // 2)
+                self.current_lin = 0.10
+                self.current_ang = np.clip(-error / 150.0, -0.8, 0.8)
+                # rospy.loginfo("🔴 One Cone Close: Steering Away")
+
+        # [긴급] 면적이 너무 크면 박기 직전이므로 멈추거나 급회전
+        if max_area > 18000:
+            self.current_lin = 0.0
+            self.current_ang = 0.4 if centers[0] < (w // 2) else -0.4
+
+    # ============================================================
+    # LANE / UTIL
+    # ============================================================
     def edge_lane_control(self, img):
         h, w, _ = img.shape
         roi = img[int(h * 0.5):, :]
         gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (5,5), 0)
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-       
+        
         col_sum = np.sum(binary > 0, axis=0)
         if np.max(col_sum) < 5:
             self.current_lin, self.current_ang = 0.0, self.search_spin_speed
             return
 
         idx = np.where(col_sum >= max(5, int(np.max(col_sum) * 0.3)))[0]
-        track_center = np.mean(idx) # 가중치 방식보다 조명 노이즈에 강함
+        track_center = np.mean(idx)
         offset = track_center - (w / 2.0)
         self.current_lin, self.current_ang = self.forward_speed, np.clip(-self.k_angle * offset, -0.8, 0.8)
 
