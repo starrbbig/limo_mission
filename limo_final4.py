@@ -7,9 +7,9 @@ from geometry_msgs.msg import Twist
 import numpy as np
 import cv2
 
-class EdgeLaneNoBridge:
+class LimoArcAvoidance:
     def __init__(self):
-        rospy.init_node("edge_lane_nobridge_node")
+        rospy.init_node("limo_arc_avoidance_node")
 
         # Subscriber & Publisher
         rospy.Subscriber("/usb_cam/image_raw", Image, self.image_callback, queue_size=1)
@@ -21,23 +21,23 @@ class EdgeLaneNoBridge:
         self.current_ang = 0.0
         self.encoding = None
 
-        # ===== [기존 파라미터 유지] =====
-        self.forward_speed = 0.15 
-        self.search_spin_speed = 0.25 
-        self.k_angle = 0.010 
+        # ===== 제어 파라미터 =====
+        self.forward_speed = 0.12     # 기본 주행 속도
+        self.search_spin_speed = 0.25 # 차선 상실 시 회전 속도
+        self.k_angle = 0.010          # 차선 추종 감도
 
-        # ===== [상태 제어 변수 수정] =====
-        # LANE -> BACK -> ESCAPE_TURN -> ESCAPE_STRAIGHT 순서로 동작
+        # ===== 상태 제어 변수 (LANE -> BACK -> ESCAPE) =====
         self.state = "LANE"
         self.state_start = 0.0
         self.front_dist = 999.0
         self.scan_ranges = []
         self.escape_angle = 0.0
 
-        rospy.loginfo("🚀 장애물 회피 강화 버전(2단계 탈출) 시작")
+        rospy.loginfo("🚀 2단계 곡선 회피(Arc Avoidance) 버전 시작")
 
     def lidar_callback(self, scan):
         self.scan_ranges = np.array(scan.ranges)
+        # 정면 감지 (좌우 15도씩 총 30도)
         front_indices = np.concatenate([self.scan_ranges[:15], self.scan_ranges[-15:]])
         cleaned = [d for d in front_indices if d > 0.15 and not np.isnan(d)]
         self.front_dist = np.median(cleaned) if cleaned else 999.0
@@ -45,47 +45,38 @@ class EdgeLaneNoBridge:
     def image_callback(self, msg: Image):
         now = rospy.Time.now().to_sec()
 
-        # [1. 장애물 회피 로직 - 강화됨]
+        # [1. 장애물 회피 로직 - 2단계 모드]
         
-        # 1-1. 후진
+        # 1-1. 후진 (BACK)
         if self.state == "BACK":
-            if now - self.state_start < 1.3: # 후진 시간 약간 늘림
+            if now - self.state_start < 1.2: 
                 self.current_lin = -0.15
                 self.current_ang = 0.0
             else:
-                self.current_lin = 0.0
-                self.escape_angle = self.find_best_gap()
-                self.state = "ESCAPE_TURN" # 바로 안 나가고 '회전'부터 함
+                # 후진 완료 후, 전방 120도 범위 내에서만 최적의 각도 탐색
+                self.escape_angle = self.find_best_gap_forward()
+                self.state = "ESCAPE"
                 self.state_start = now
             return
 
-        # 1-2. 제자리 회전 (장애물 없는 쪽으로 고개 돌리기)
-        if self.state == "ESCAPE_TURN":
-            if now - self.state_start < 1.0: # 1초간 제자리 회전
-                self.current_lin = 0.0
-                # 각도 배율을 높여 더 확실하게 꺾음
-                self.current_ang = np.clip(self.escape_angle * 2.5, -1.2, 1.2)
-            else:
-                self.state = "ESCAPE_STRAIGHT" # 이제 앞으로 나감
-                self.state_start = now
-            return
-
-        # 1-3. 전방 주행 (장애물 옆 통과하기)
-        if self.state == "ESCAPE_STRAIGHT":
-            if now - self.state_start < 1.2: # 1.2초간 장애물 옆을 지나침
+        # 1-2. 곡선 탈출 (ESCAPE: 전진 + 회전 동시)
+        if self.state == "ESCAPE":
+            # 1.5초간 핸들을 꺾은 채 앞으로 전진하여 장애물을 옆으로 비껴감
+            if now - self.state_start < 1.5:
                 self.current_lin = 0.12
-                self.current_ang = 0.0 # 직진해서 옆구리 안 걸리게 함
+                # 제자리 회전이 아닌 '주행 중 회전'이므로 배율을 적절히 조절 (1.5 ~ 2.0)
+                self.current_ang = np.clip(self.escape_angle * 1.8, -0.8, 0.8)
             else:
                 self.state = "LANE"
             return
 
-        # [감지] 
+        # [장애물 감지 트리거]
         if self.front_dist < 0.45:
             self.state = "BACK"
             self.state_start = now
             return
 
-        # [2. 기존 차선 인식 로직 - 원본 보존]
+        # [2. 기본 차선 인식 주행 (LANE)]
         img = self.msg_to_cv2(msg)
         if img is None:
             self.current_lin, self.current_ang = 0.0, self.search_spin_speed
@@ -99,8 +90,7 @@ class EdgeLaneNoBridge:
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         
         kernel = np.ones((3, 3), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary = cv2.morphologyEx(cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel), cv2.MORPH_CLOSE, kernel)
 
         col_sum = np.sum(binary > 0, axis=0)
         max_val = int(np.max(col_sum)) if col_sum.size > 0 else 0
@@ -112,31 +102,30 @@ class EdgeLaneNoBridge:
         threshold_val = max(5, int(max_val * 0.3))
         candidates = np.where(col_sum >= threshold_val)[0]
 
-        if candidates.size == 0:
-            self.current_lin, self.current_ang = 0.0, self.search_spin_speed
-            return
+        if candidates.size > 0:
+            x_indices = np.arange(len(col_sum))
+            track_center_x = float(np.sum(x_indices[candidates] * col_sum[candidates]) / np.sum(col_sum[candidates]))
+            offset = track_center_x - center
+            self.current_ang = np.clip(-self.k_angle * offset, -0.8, 0.8)
+            self.current_lin = self.forward_speed
 
-        x_indices = np.arange(len(col_sum))
-        track_center_x = float(np.sum(x_indices[candidates] * col_sum[candidates]) / np.sum(col_sum[candidates]))
-
-        offset = track_center_x - center
-        ang = -self.k_angle * offset
-        self.current_lin = self.forward_speed
-        self.current_ang = np.clip(ang, -0.8, 0.8)
-
-    def find_best_gap(self):
+    def find_best_gap_forward(self):
+        """뒤쪽을 보지 않고 전방 좌우 60도(총 120도) 안에서만 탈출구 탐색"""
         if len(self.scan_ranges) == 0: return 0.0
         raw = np.array(self.scan_ranges)
-        ranges = np.concatenate([raw[-75:], raw[:75]])
+        
+        # 뒤쪽 데이터(90~270도)를 완전히 배제하여 한바퀴 도는 현상 방지
+        ranges = np.concatenate([raw[-60:], raw[:60]]) 
         ranges = np.nan_to_num(ranges, nan=0.0, posinf=3.5, neginf=0.0)
         
-        # 윈도우 사이즈를 늘려(30) 더 넓은 공간을 찾게 함
-        window_size = 30 
+        # 윈도우 평균으로 안정적인 빈 공간 탐색
+        window_size = 20 
         smoothed = np.convolve(ranges, np.ones(window_size)/window_size, mode='same')
         
         best_idx = np.argmax(smoothed)
-        # 선택된 각도에서 바깥쪽으로 5도 정도 더 여유를 줌 (장애물에서 멀어지게)
-        angle_deg = (best_idx - 90)
+        angle_deg = (best_idx - 60) # -60 ~ +60도 사이의 결과값
+        
+        # 장애물로부터 약간 더 멀어지기 위한 보정
         if angle_deg > 0: angle_deg += 5
         else: angle_deg -= 5
             
@@ -161,5 +150,5 @@ class EdgeLaneNoBridge:
             rate.sleep()
 
 if __name__ == "__main__":
-    node = EdgeLaneNoBridge()
+    node = LimoArcAvoidance()
     node.spin()
