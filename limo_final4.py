@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import rospy
 import cv2
 import numpy as np
@@ -39,7 +36,7 @@ class LimoFinalController:
         self.escape_angle = 0.0
         self.robot_width = 0.13
 
-        rospy.loginfo("✅ LIMO FINAL CONTROLLER (ARC ESCAPE VER.) STARTED")
+        rospy.loginfo("✅ LIMO FINAL CONTROLLER (SMART ESCAPE VER.) STARTED")
 
     # ============================================================
     # LIDAR
@@ -48,9 +45,11 @@ class LimoFinalController:
         raw = np.array(scan.ranges)
         self.scan_ranges = raw
         # 정면 20도 영역 감지 (좌우 10도씩)
-        front_zone = np.concatenate([raw[:10], raw[-10:]])
-        cleaned = [d for d in front_zone if d > 0.15 and not np.isnan(d)]
-        self.front = np.median(cleaned) if cleaned else 999.0
+        # 인덱스 0이 정면이라고 가정 (LIMO 일반적 설정)
+        if len(raw) > 0:
+            front_zone = np.concatenate([raw[:10], raw[-10:]])
+            cleaned = [d for d in front_zone if d > 0.15 and not np.isnan(d) and not np.isinf(d)]
+            self.front = np.median(cleaned) if cleaned else 999.0
 
     # ============================================================
     # IMAGE CALLBACK (STATE MACHINE)
@@ -85,16 +84,46 @@ class LimoFinalController:
             self.edge_lane_control(img)
 
     # ============================================================
-    # BACK / ESCAPE (2단계 곡선 회피로 수정됨)
+    # BACK / ESCAPE (수정된 부분: 스마트 회피 로직 적용)
     # ============================================================
     def back_control(self, now):
-        """1단계: 짧게 후진하며 탈출 각도 계산"""
+        """1단계: 후진 후 장애물 위치를 판단하여 반대로 방향 설정"""
+        # 1.2초 동안 후진
         if now - self.state_start < 1.2:
             self.current_lin = -0.15
             self.current_ang = 0.0
         else:
-            # 후진 끝나는 시점에 가장 뚫린 방향 찾기
-            self.escape_angle = self.find_gap_max_forward()
+            # 후진이 끝나는 순간 판단
+            best_angle = self.find_gap_max_forward()
+           
+            raw = np.array(self.scan_ranges)
+           
+            # [수정된 로직: 좌우 밀도 비교하여 강제 회전]
+            if len(raw) > 0:
+                # 0.0(에러)이나 inf(무한대)를 3.5m(안전값)로 치환하여 평균 계산 왜곡 방지
+                safe_raw = np.where((raw < 0.1) | np.isnan(raw) | np.isinf(raw), 3.5, raw)
+               
+                # 정면 기준 좌측(10~60도) vs 우측(-60~-10도) 평균 거리 계산
+                left_zone = safe_raw[10:60]
+                right_zone = safe_raw[-60:-10]
+               
+                if len(left_zone) > 0 and len(right_zone) > 0:
+                    avg_left = np.mean(left_zone)
+                    avg_right = np.mean(right_zone)
+                   
+                    # 왼쪽 벽이 오른쪽보다 현저히 가까움 -> 장애물이 왼쪽에 있음 -> 오른쪽으로 가야 함
+                    if avg_left < avg_right * 0.8:
+                        if best_angle > -0.1: # 현재 계산된 각도가 왼쪽을 보고 있다면
+                            best_angle = -0.7 # 강제로 우회전(약 40도)
+                            rospy.loginfo(f"🚧 Left Obstacle({avg_left:.2f}m) -> Force RIGHT Turn")
+                           
+                    # 오른쪽 벽이 현저히 가까움 -> 장애물이 오른쪽에 있음 -> 왼쪽으로 가야 함
+                    elif avg_right < avg_left * 0.8:
+                        if best_angle < 0.1: # 현재 계산된 각도가 오른쪽을 보고 있다면
+                            best_angle = 0.7  # 강제로 좌회전
+                            rospy.loginfo(f"🚧 Right Obstacle({avg_right:.2f}m) -> Force LEFT Turn")
+
+            self.escape_angle = best_angle
             self.state = "ESCAPE"
             self.state_start = now
 
@@ -102,7 +131,7 @@ class LimoFinalController:
         """2단계: 전진과 회전을 동시에 하여 곡선으로 탈출"""
         if now - self.state_start < 1.5:  # 1.5초간 곡선 주행
             self.current_lin = 0.12
-            # 찾은 각도에 가중치를 주어 부드럽게 회전 (배율 1.5~1.8)
+            # 찾은 각도에 가중치를 주어 부드럽게 회전
             self.current_ang = np.clip(self.escape_angle * 1.5, -0.8, 0.8)
         else:
             self.state = "LANE"
@@ -129,7 +158,7 @@ class LimoFinalController:
         return (angle_deg + safe_margin) * np.pi / 180.0
 
     # ============================================================
-    # CONE / LANE (기존 로직 최적화 유지)
+    # CONE / LANE
     # ============================================================
     def detect_cone(self, img):
         h, w = img.shape[:2]
@@ -161,7 +190,7 @@ class LimoFinalController:
             return
 
         idx = np.where(col_sum >= max(5, int(np.max(col_sum) * 0.3)))[0]
-        track_center = np.mean(idx) # 가중치 방식보다 조명 노이즈에 강함
+        track_center = np.mean(idx)
         offset = track_center - (w / 2.0)
         self.current_lin, self.current_ang = self.forward_speed, np.clip(-self.k_angle * offset, -0.8, 0.8)
 
@@ -180,3 +209,4 @@ class LimoFinalController:
 
 if __name__ == "__main__":
     LimoFinalController().spin()
+
