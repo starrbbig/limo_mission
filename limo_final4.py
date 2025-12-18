@@ -85,6 +85,50 @@ class EdgeLaneNoBridge:
             self.state_start = now
             return
 
+    def detect_cone(self, img):
+        h, w = img.shape[:2]
+        roi = img[int(h * 0.55):, :]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        lower_r1 = np.array([0, 120, 80])
+        upper_r1 = np.array([10, 255, 255])
+        lower_r2 = np.array([170, 120, 80])
+        upper_r2 = np.array([180, 255, 255])
+
+        mask = cv2.inRange(hsv, lower_r1, upper_r1) | \
+               cv2.inRange(hsv, lower_r2, upper_r2)
+
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        self.red_contours = [c for c in contours if cv2.contourArea(c) > 200]
+        return len(self.red_contours) > 0
+
+      
+        
+    def cone_control(self, img):
+        h, w = img.shape[:2]
+        centers = []
+
+        for c in self.red_contours:
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                centers.append(int(M["m10"] / M["m00"]))
+
+        if not centers:
+            return
+
+        if len(centers) >= 2:
+            mid = (min(centers) + max(centers)) // 2
+        else:
+            mid = centers[0]
+
+        error = mid - (w // 2)
+        self.current_lin = 0.13
+        self.current_ang = error / 180.0
+    
+
         # [2. 기존 차선 인식 로직 - 원본 보존]
         img = self.msg_to_cv2(msg)
         if img is None:
