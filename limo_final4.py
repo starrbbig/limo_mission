@@ -140,14 +140,38 @@ class LimoFinalController:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         self.red_contours = [c for c in contours if cv2.contourArea(c) > 200]
         return len(self.red_contours) > 0
-
-    def cone_control(self, img):
+        
+def cone_control(self, img):
         h, w = img.shape[:2]
-        centers = [int(cv2.moments(c)["m10"]/cv2.moments(c)["m00"]) for c in self.red_contours if cv2.moments(c)["m00"] > 0]
+        centers = []
+        for c in self.red_contours:
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                centers.append(int(M["m10"] / M["m00"]))
+        
         if not centers: return
-        mid = (min(centers) + max(centers)) // 2 if len(centers) >= 2 else centers[0]
+
+        # [핵심 수정] 라바콘이 딱 하나만 보일 때 (처음 발견 혹은 외톨이 콘)
+        if len(centers) == 1:
+            rospy.logwarn("📢 라바콘 1개 감지! 오른쪽 30도 회피 기동을 시작합니다.")
+            
+            # 현재 상태를 후진(BACK)으로 보내서 충돌 방지 공간 확보
+            self.state = "BACK"
+            self.state_start = rospy.Time.now().to_sec()
+            
+            # 후진 후 탈출 각도를 오른쪽 30도로 고정 예약
+            # (LIMO 기준: 왼쪽이 +, 오른쪽이 - 이므로 -30도 적용)
+            self.escape_angle = -30.0 * np.pi / 180.0 
+            return
+
+        # [기존 로직] 라바콘이 2개 이상일 때 (그 사이로 주행)
+        rospy.loginfo("🎯 라바콘 2개 확인: 사이로 통과합니다.")
+        mid = (min(centers) + max(centers)) // 2
         error = mid - (w // 2)
-        self.current_lin, self.current_ang = 0.13, np.clip(-error / 180.0, -0.8, 0.8)
+        
+        # 분모를 220.0으로 키워 와리가리 현상 방지
+        self.current_lin = 0.10
+        self.current_ang = np.clip(-error / 220.0, -0.5, 0.5)
 
     def edge_lane_control(self, img):
         h, w, _ = img.shape
