@@ -29,8 +29,8 @@ class LimoFinalController:
         self.encoding = None
 
         # ---------------- LANE 파라미터 ----------------
-        self.forward_speed = 0.3
-        self.search_spin_speed = 0.3
+        self.forward_speed = 0.12
+        self.search_spin_speed = 0.25
         self.k_angle = 0.010
 
         # ---------------- LIDAR 파라미터 ----------------
@@ -57,7 +57,7 @@ class LimoFinalController:
     # ============================================================
     def image_cb(self, msg):
         now = rospy.Time.now().to_sec()
-        
+       
         # [단계 1: 장애물 회피 상태 우선 실행]
         if self.state == "BACK":
             self.back_control(now)
@@ -110,20 +110,20 @@ class LimoFinalController:
     def find_gap_max_forward(self):
         """전방 120도 안에서 로봇이 지나갈 수 있는 가장 넓은 공간 탐색"""
         if len(self.scan_ranges) == 0: return 0.0
-        
+       
         raw = np.array(self.scan_ranges)
         # 뒤쪽은 아예 안 봄 (전방 좌우 60도씩 총 120도)
         ranges = np.concatenate([raw[-60:], raw[:60]])
         # 결측치 및 너무 가까운 거리 처리
         ranges = np.nan_to_num(ranges, nan=0.0, posinf=3.5, neginf=0.0)
-        
+       
         # 윈도우 평균(Convolution)을 통해 '한 점'이 아닌 '길'을 찾음
         window_size = 20
         smoothed = np.convolve(ranges, np.ones(window_size)/window_size, mode='same')
-        
+       
         best_idx = np.argmax(smoothed)
         angle_deg = best_idx - 60 # 인덱스를 각도로 변환 (-60 ~ +60)
-        
+       
         # 장애물로부터 조금 더 안전하게 떨어지기 위한 보정(+/- 5도)
         safe_margin = 5 if angle_deg > 0 else -5
         return (angle_deg + safe_margin) * np.pi / 180.0
@@ -154,7 +154,7 @@ class LimoFinalController:
         roi = img[int(h * 0.5):, :]
         gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (5,5), 0)
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        
+       
         col_sum = np.sum(binary > 0, axis=0)
         if np.max(col_sum) < 5:
             self.current_lin, self.current_ang = 0.0, self.search_spin_speed
