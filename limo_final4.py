@@ -11,6 +11,7 @@ class EdgeLaneNoBridge:
     def __init__(self):
         rospy.init_node("edge_lane_nobridge_node")
 
+        # Subscriber & Publisher
         rospy.Subscriber("/usb_cam/image_raw", Image, self.image_callback, queue_size=1)
         rospy.Subscriber("/scan", LaserScan, self.lidar_callback, queue_size=1)
         self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=3)
@@ -20,19 +21,20 @@ class EdgeLaneNoBridge:
         self.current_ang = 0.0
         self.encoding = None
 
-        # ===== [기존 파라미터] =====
+        # ===== [기존 파라미터 유지] =====
         self.forward_speed = 0.12 
         self.search_spin_speed = 0.25 
         self.k_angle = 0.010 
 
-        # ===== [상태 제어] =====
+        # ===== [상태 제어 변수 수정] =====
+        # LANE -> BACK -> ESCAPE_TURN -> ESCAPE_STRAIGHT 순서로 동작
         self.state = "LANE"
         self.state_start = 0.0
         self.front_dist = 999.0
         self.scan_ranges = []
-        self.escape_dir = 0.0 # 왼쪽(+1), 오른쪽(-1) 판단용
+        self.escape_angle = 0.0
 
-        rospy.loginfo("🚀 회피 기동 자연화 버전 시작")
+        rospy.loginfo("🚀 장애물 회피 강화 버전(2단계 탈출) 시작")
 
     def lidar_callback(self, scan):
         self.scan_ranges = np.array(scan.ranges)
@@ -43,35 +45,47 @@ class EdgeLaneNoBridge:
     def image_callback(self, msg: Image):
         now = rospy.Time.now().to_sec()
 
-        # 1. 후진 (짧고 빠르게)
+        # [1. 장애물 회피 로직 - 강화됨]
+        
+        # 1-1. 후진
         if self.state == "BACK":
-            if now - self.state_start < 0.8:
+            if now - self.state_start < 1.3: # 후진 시간 약간 늘림
                 self.current_lin = -0.15
                 self.current_ang = 0.0
             else:
-                # 어느 쪽이 더 비었는지 방향만 결정
-                self.escape_dir = self.get_escape_direction()
-                self.state = "ESCAPE_TURN"
+                self.current_lin = 0.0
+                self.escape_angle = self.find_best_gap()
+                self.state = "ESCAPE_TURN" # 바로 안 나가고 '회전'부터 함
                 self.state_start = now
             return
 
-        # 2. 제자리 회전 (비어있는 방향으로 살짝만 고개 돌리기)
+        # 1-2. 제자리 회전 (장애물 없는 쪽으로 고개 돌리기)
         if self.state == "ESCAPE_TURN":
-            if now - self.state_start < 0.8:
+            if now - self.state_start < 1.0: # 1초간 제자리 회전
                 self.current_lin = 0.0
-                # 비어있는 방향으로 확실히 회전
-                self.current_ang = 0.8 * self.escape_dir
+                # 각도 배율을 높여 더 확실하게 꺾음
+                self.current_ang = np.clip(self.escape_angle * 2.5, -1.2, 1.2)
             else:
-                self.state = "LANE" # 바로 차선 추종으로 복귀하되, 회피 로직이 섞임
+                self.state = "ESCAPE_STRAIGHT" # 이제 앞으로 나감
+                self.state_start = now
             return
 
-        # [감지]
-        if self.front_dist < 0.40:
+        # 1-3. 전방 주행 (장애물 옆 통과하기)
+        if self.state == "ESCAPE_STRAIGHT":
+            if now - self.state_start < 1.2: # 1.2초간 장애물 옆을 지나침
+                self.current_lin = 0.12
+                self.current_ang = 0.0 # 직진해서 옆구리 안 걸리게 함
+            else:
+                self.state = "LANE"
+            return
+
+        # [감지] 
+        if self.front_dist < 0.45:
             self.state = "BACK"
             self.state_start = now
             return
 
-        # 3. 차선 인식 주행 (기존 로직)
+        # [2. 기존 차선 인식 로직 - 원본 보존]
         img = self.msg_to_cv2(msg)
         if img is None:
             self.current_lin, self.current_ang = 0.0, self.search_spin_speed
@@ -81,8 +95,13 @@ class EdgeLaneNoBridge:
         center = w / 2.0
         roi = img[int(h * 0.5):, :]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         
+        kernel = np.ones((3, 3), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
         col_sum = np.sum(binary > 0, axis=0)
         max_val = int(np.max(col_sum)) if col_sum.size > 0 else 0
 
@@ -92,32 +111,46 @@ class EdgeLaneNoBridge:
 
         threshold_val = max(5, int(max_val * 0.3))
         candidates = np.where(col_sum >= threshold_val)[0]
+
+        if candidates.size == 0:
+            self.current_lin, self.current_ang = 0.0, self.search_spin_speed
+            return
+
         x_indices = np.arange(len(col_sum))
         track_center_x = float(np.sum(x_indices[candidates] * col_sum[candidates]) / np.sum(col_sum[candidates]))
 
-        # 조향 제어
         offset = track_center_x - center
         ang = -self.k_angle * offset
-        
-        # [수정] 장애물을 피한 직후라면, 차선 중앙보다 약간 더 바깥쪽을 타도록 유도
-        # (옆구리 박는 현상 방지)
         self.current_lin = self.forward_speed
         self.current_ang = np.clip(ang, -0.8, 0.8)
 
-    def get_escape_direction(self):
-        # 정면 기준 좌우 90도씩 합계 거리를 비교하여 더 넓은 쪽 선택
-        if len(self.scan_ranges) == 0: return 1.0
+    def find_best_gap(self):
+        if len(self.scan_ranges) == 0: return 0.0
         raw = np.array(self.scan_ranges)
-        right_sum = np.nansum(raw[-90:])
-        left_sum = np.nansum(raw[:90])
-        return 1.0 if left_sum > right_sum else -1.0
+        ranges = np.concatenate([raw[-90:], raw[:90]])
+        ranges = np.nan_to_num(ranges, nan=0.0, posinf=3.5, neginf=0.0)
+        
+        # 윈도우 사이즈를 늘려(30) 더 넓은 공간을 찾게 함
+        window_size = 30 
+        smoothed = np.convolve(ranges, np.ones(window_size)/window_size, mode='same')
+        
+        best_idx = np.argmax(smoothed)
+        # 선택된 각도에서 바깥쪽으로 5도 정도 더 여유를 줌 (장애물에서 멀어지게)
+        angle_deg = (best_idx - 90)
+        if angle_deg > 0: angle_deg += 5
+        else: angle_deg -= 5
+            
+        return angle_deg * (np.pi / 180.0)
 
     def msg_to_cv2(self, msg):
         if self.encoding is None: self.encoding = msg.encoding
         h, w = msg.height, msg.width
-        arr = np.frombuffer(msg.data, dtype=np.uint8)
-        img = arr.reshape(h, msg.step // 3, 3)[:, :w, :]
-        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR) if self.encoding == "rgb8" else img
+        if self.encoding in ("rgb8", "bgr8"):
+            arr = np.frombuffer(msg.data, dtype=np.uint8)
+            img = arr.reshape(h, msg.step // 3, 3)[:, :w, :]
+            if self.encoding == "rgb8": img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            return img
+        return None
 
     def spin(self):
         rate = rospy.Rate(20)
