@@ -39,20 +39,25 @@ class LimoFinalController:
         self.escape_angle = 0.0
         self.robot_width = 0.13
 
-        rospy.loginfo("✅ LIMO FINAL CONTROLLER (ARC ESCAPE VER.) STARTED")
+        rospy.loginfo("✅ LIMO FINAL (CONE/WALL/BOX) STARTED")
 
     # ============================================================
-    # LIDAR
+    # LIDAR: [수정] 벽과 장애물을 구분하기 위해 감지 범위 확대
     # ============================================================
     def lidar_cb(self, scan):
         raw = np.array(scan.ranges)
         self.scan_ranges = raw
-        front_zone = np.concatenate([raw[:10], raw[-10:]])
-        cleaned = [d for d in front_zone if d > 0.15 and not np.isnan(d)]
-        self.front = np.median(cleaned) if cleaned else 999.0
+        
+        # [변경 이유] 기존 20도(10+10)는 너무 좁아 측면의 '벽'을 못 봅니다.
+        # 정면 90도 영역(좌우 45도씩)을 감시하여 측면 벽 충돌을 방지합니다.
+        front_wide_zone = np.concatenate([raw[:45], raw[-45:]])
+        cleaned = [d for d in front_wide_zone if d > 0.15 and not np.isnan(d)]
+        
+        # 하얀색 박스나 벽이 감지되면 BACK 상태를 트리거하기 위해 최소값 사용
+        self.front = np.min(cleaned) if cleaned else 999.0
 
     # ============================================================
-    # IMAGE CALLBACK (STATE MACHINE)
+    # IMAGE CALLBACK (STATE MACHINE) - 구조 유지
     # ============================================================
     def image_cb(self, msg):
         now = rospy.Time.now().to_sec()
@@ -65,7 +70,8 @@ class LimoFinalController:
             self.escape_control(now)
             return
 
-        if self.front < 0.45:
+        # [단계 2: 하얀 박스나 벽에 가까워지면 회피 동작 실행]
+        if self.front < 0.35: # 너무 가까우면 박으니까 0.35m로 설정
             self.state = "BACK"
             self.state_start = now
             return
@@ -75,13 +81,14 @@ class LimoFinalController:
             self.current_lin, self.current_ang = 0.0, self.search_spin_speed
             return
 
+        # [단계 3: 빨간 라바콘 감지 시 사이 주행 로직 실행]
         if self.detect_cone(img):
             self.cone_control(img)
         else:
             self.edge_lane_control(img)
 
     # ============================================================
-    # BACK / ESCAPE
+    # BACK / ESCAPE - 기존 코드 그대로 유지
     # ============================================================
     def back_control(self, now):
         if now - self.state_start < 1.2:
@@ -112,7 +119,7 @@ class LimoFinalController:
         return (angle_deg + safe_margin) * np.pi / 180.0
 
     # ============================================================
-    # CONE CONTROL (업그레이드 버전: 양쪽 탐색 및 사이 주행)
+    # CONE: [수정] 박치기 방지 및 사이 주행 로직
     # ============================================================
     def detect_cone(self, img):
         h, w = img.shape[:2]
@@ -125,56 +132,26 @@ class LimoFinalController:
         return len(self.red_contours) > 0
 
     def cone_control(self, img):
-        """라바콘 박치기 방지 및 사이 주행 로직"""
+        """[변경] 라바콘 사이를 목표로 하고, 하나일 땐 빗겨가기"""
         h, w = img.shape[:2]
-        # 중심점 좌표 추출
         centers = [int(cv2.moments(c)["m10"]/cv2.moments(c)["m00"]) for c in self.red_contours if cv2.moments(c)["m00"] > 0]
         if not centers: return
 
-        # 거리를 가늠하기 위한 가장 큰 라바콘의 면적
-        max_area = max([cv2.contourArea(c) for c in self.red_contours])
-
-        # [케이스 1] 라바콘이 2개 이상 보일 때 -> 정중앙으로 통과
+        # 라바콘이 2개 보이면 -> 그 정중앙(사이)으로 가기
         if len(centers) >= 2:
-            left_c = min(centers)
-            right_c = max(centers)
-            mid_target = (left_c + right_c) // 2
-            error = mid_target - (w // 2)
-            
-            self.current_lin = 0.12
-            self.current_ang = np.clip(-error / 150.0, -0.8, 0.8)
-            # rospy.loginfo("🔴🔴 Two Cones: Passing Middle")
-
-        # [케이스 2] 라바콘이 하나만 보일 때 -> 박치기 방지 및 탐색
+            mid_target = (min(centers) + max(centers)) // 2
+        # 라바콘이 1개만 보이면 -> 박치기 하지 말고 옆으로 빗겨가기
         else:
             cone_x = centers[0]
-            
-            # (A) 거리가 멀 때: 다른 하나를 찾기 위해 살짝 회전 탐색
-            if max_area < 6000:
-                self.current_lin = 0.07 
-                # 라바콘이 왼쪽에 있으면 오른쪽을 더 보려고 시도
-                self.current_ang = 0.25 if cone_x < (w // 2) else -0.25
-                # rospy.loginfo("🔍 One Cone: Searching for the other...")
-            
-            # (B) 거리가 가까울 때: 보이지 않는 반대편 가상 공간으로 피하기
-            else:
-                if cone_x < (w // 2): # 왼쪽 라바콘이면 오른쪽으로 빗겨가기
-                    target_offset = cone_x + (w // 3)
-                else:                 # 오른쪽 라바콘이면 왼쪽으로 빗겨가기
-                    target_offset = cone_x - (w // 3)
-                
-                error = target_offset - (w // 2)
-                self.current_lin = 0.10
-                self.current_ang = np.clip(-error / 150.0, -0.8, 0.8)
-                # rospy.loginfo("🔴 One Cone Close: Steering Away")
+            # 라바콘이 왼쪽에 있으면 오른쪽 빈 공간(w/3) 타겟팅
+            mid_target = cone_x + (w // 3) if cone_x < (w // 2) else cone_x - (w // 3)
 
-        # [긴급] 면적이 너무 크면 박기 직전이므로 멈추거나 급회전
-        if max_area > 18000:
-            self.current_lin = 0.0
-            self.current_ang = 0.4 if centers[0] < (w // 2) else -0.4
+        error = mid_target - (w // 2)
+        # 조향 상수 180.0을 사용하여 부드럽게 꺾음
+        self.current_lin, self.current_ang = 0.12, np.clip(-error / 180.0, -0.6, 0.6)
 
     # ============================================================
-    # LANE / UTIL
+    # LANE / UTIL - 기존 코드 그대로 유지
     # ============================================================
     def edge_lane_control(self, img):
         h, w, _ = img.shape
