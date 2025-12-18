@@ -245,21 +245,29 @@ class LimoFinalController:
 
         return angle
 
+   
     def find_gap_max(self):
         if len(self.scan_ranges) == 0:
             return 0.0
 
         raw = np.array(self.scan_ranges)
-        ranges = np.concatenate([raw[-60:], raw[:60]])
-        ranges = np.where((ranges < 0.20) | np.isnan(ranges), 0.0, ranges)
+        ranges = np.concatenate([raw[-90:], raw[:90]])
+        ranges = np.nan_to_num(ranges, nan=0.0, posinf=3.5, neginf=0.0)
 
-        idx = np.argmax(ranges)
-        if ranges[idx] < (self.robot_width + 0.10):
-            return 0.0
+        window_size = 30
+        smoothed = np.convolve(
+            ranges, np.ones(window_size) / window_size, mode='same'
+        )
 
-        angle_deg = idx - 60
+        idx = np.argmax(smoothed)
+        angle_deg = idx - 90
+
+        if angle_deg > 0:
+            angle_deg += 5
+        else:
+            angle_deg -= 5
+
         return angle_deg * np.pi / 180.0
-
     # ============================================================
     # PUBLISH LOOP
     # ============================================================
