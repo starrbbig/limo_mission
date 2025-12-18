@@ -22,7 +22,7 @@ class EdgeLaneNoBridge:
         self.encoding = None
 
         # ===== [기존 파라미터 유지] =====
-        self.forward_speed = 0.12 
+        self.forward_speed = 0.15 
         self.search_spin_speed = 0.25 
         self.k_angle = 0.010 
 
@@ -127,7 +127,7 @@ class EdgeLaneNoBridge:
     def find_best_gap(self):
         if len(self.scan_ranges) == 0: return 0.0
         raw = np.array(self.scan_ranges)
-        ranges = np.concatenate([raw[-90:], raw[:90]])
+        ranges = np.concatenate([raw[-75:], raw[:75]])
         ranges = np.nan_to_num(ranges, nan=0.0, posinf=3.5, neginf=0.0)
         
         # 윈도우 사이즈를 늘려(30) 더 넓은 공간을 찾게 함
