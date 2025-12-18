@@ -29,8 +29,8 @@ class LimoFinalController:
         self.encoding = None
 
         # ---------------- LANE 파라미터 ----------------
-        self.forward_speed = 0.12
-        self.search_spin_speed = 0.25
+        self.forward_speed = 0.3
+        self.search_spin_speed = 0.3
         self.k_angle = 0.010
 
         # ---------------- LIDAR 파라미터 ----------------
