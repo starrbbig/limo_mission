@@ -128,52 +128,27 @@ class LimoFinalController:
         safe_margin = 5 if angle_deg > 0 else -5
         return (angle_deg + safe_margin) * np.pi / 180.0
 
-   # ============================================================
-    # CONE / LANE (라바콘 1개 시 강제 후진/우회전 로직 적용)
+    # ============================================================
+    # CONE / LANE (기존 로직 최적화 유지)
     # ============================================================
     def detect_cone(self, img):
-        """라바콘 감지: ROI를 조금 더 위까지 보고 면적 기준 최적화"""
         h, w = img.shape[:2]
-        # ROI를 0.4로 수정하여 조금 더 멀리 있는 콘도 미리 감지
-        roi = img[int(h * 0.4):, :] 
+        roi = img[int(h * 0.55):, :]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        
-        # 빨간색 마스크 (두 영역 합침)
-        mask = cv2.inRange(hsv, np.array([0, 100, 50]), np.array([10, 255, 255])) | \
-               cv2.inRange(hsv, np.array([170, 100, 50]), np.array([180, 255, 255]))
-        
+        mask = cv2.inRange(hsv, np.array([0,120,80]), np.array([10,255,255])) | \
+               cv2.inRange(hsv, np.array([170,120,80]), np.array([180,255,255]))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        # 노이즈 방지를 위해 면적 기준 200 유지
         self.red_contours = [c for c in contours if cv2.contourArea(c) > 200]
         return len(self.red_contours) > 0
 
     def cone_control(self, img):
-        """라바콘 제어: 1개 감지 시 BACK 상태로 강제 전환 후 우측 조준"""
         h, w = img.shape[:2]
-        centers = []
-        for c in self.red_contours:
-            M = cv2.moments(c)
-            if M["m00"] > 0:
-                centers.append(int(M["m10"] / M["m00"]))
-        
+        centers = [int(cv2.moments(c)["m10"]/cv2.moments(c)["m00"]) for c in self.red_contours if cv2.moments(c)["m00"] > 0]
         if not centers: return
-
-        # [핵심] 라바콘이 1개만 보일 때 (코스 이탈 위험 상황)
-        if len(centers) == 1:
-            rospy.logwarn("⚠️ 라바콘 1개 감지: 후진 후 우측으로 회피합니다!")
-            self.state = "BACK"
-            self.state_start = rospy.Time.now().to_sec()
-            # 후진 후 탈출할 때 무조건 오른쪽(약 35도)을 보도록 미리 설정
-            self.escape_angle = 35.0 * np.pi / 180.0 
-            return
-
-        # 라바콘이 2개 이상일 때 (정상 주행)
-        mid = (min(centers) + max(centers)) // 2
+        mid = (min(centers) + max(centers)) // 2 if len(centers) >= 2 else centers[0]
         error = mid - (w // 2)
-        
-        # 선속도를 살짝 줄이고 분모를 220으로 키워 와리가리 방지
-        self.current_lin = 0.10
-        self.current_ang = np.clip(-error / 220.0, -0.5, 0.5)
+        self.current_lin, self.current_ang = 0.13, np.clip(-error / 180.0, -0.8, 0.8)
+
     def edge_lane_control(self, img):
         h, w, _ = img.shape
         roi = img[int(h * 0.5):, :]
@@ -205,4 +180,3 @@ class LimoFinalController:
 
 if __name__ == "__main__":
     LimoFinalController().spin()
-
