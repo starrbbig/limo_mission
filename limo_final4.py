@@ -1,232 +1,240 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import rospy
 import cv2
 import numpy as np
-from sensor_msgs.msg import Image, LaserScan
+from sensor_msgs.msg import CompressedImage, LaserScan
 from geometry_msgs.msg import Twist
+from cv_bridge import CvBridge
 
 
-class LimoFinalController:
+class LineTracerWithObstacleAvoidance:
     def __init__(self):
-        rospy.init_node("limo_final_controller")
-
-        # ================= ROS =================
-        rospy.Subscriber("/usb_cam/image_raw", Image, self.image_cb, queue_size=1)
-        rospy.Subscriber("/scan", LaserScan, self.lidar_cb, queue_size=1)
+        rospy.init_node("line_tracer_with_obstacle_avoidance")
         self.pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
 
-        # ================= CMD =================
-        self.cmd = Twist()
-        self.current_lin = 0.0
-        self.current_ang = 0.0
+        rospy.Subscriber("/usb_cam/image_raw/compressed", CompressedImage, self.camera_cb)
+        rospy.Subscriber("/scan", LaserScan, self.lidar_cb)
 
-        # ================= STATE =================
-        self.state = "LANE"      # LANE / BACK / ESCAPE / CONE_PASS
-        self.state_start = rospy.Time.now().to_sec()
+        self.bridge = CvBridge()
 
-        # ================= IMAGE =================
-        self.encoding = None
-        self.red_contours = []
-
-        # ================= SPEED PARAM =================
-        self.forward_speed = 0.14
-        self.cone_speed = 0.24        # ★ 라바콘 사이 속도 상승
-        self.search_spin_speed = 0.25
-        self.k_angle = 0.010
-
-        # ================= LIDAR =================
+        # LIDAR
         self.scan_ranges = []
         self.front = 999.0
+
+        # 상태
+        self.state = "LANE"
         self.escape_angle = 0.0
+        self.state_start = rospy.Time.now().to_sec()
 
-        rospy.loginfo("✅ LIMO FINAL CONTROLLER (LIDAR CONE CENTERING ENABLED)")
+        # 라바콘 이후 모드
+        self.after_cone = False   # ⭐ 핵심
+
+        # 파라미터
+        self.robot_width = 0.14
+
+        # 흰색 차선
+        self.base_gain = 1.0 / 220.0
+        self.corner_scale = 140.0
+        self.max_steer = 0.85
+        self.left_delay_start = None
+        self.left_delay_time = 0.6
+        self.min_line_area = 300
+
+        # 검은색 바닥
+        self.black_speed = 0.20
+        self.k_black = 0.010
 
     # ============================================================
-    # LIDAR CALLBACK
-    # ============================================================
+    # LIDAR
+  
     def lidar_cb(self, scan):
         raw = np.array(scan.ranges)
         self.scan_ranges = raw
-
         front_zone = np.concatenate([raw[:10], raw[-10:]])
-        cleaned = [d for d in front_zone if d > 0.15 and not np.isnan(d)]
+        cleaned = [d for d in front_zone if d > 0.20 and not np.isnan(d)]
         self.front = np.median(cleaned) if cleaned else 999.0
 
     # ============================================================
-    # IMAGE CALLBACK (STATE MACHINE)
-    # ============================================================
-    def image_cb(self, msg):
+    # CAMERA
+   
+    def camera_cb(self, msg):
+        twist = Twist()
         now = rospy.Time.now().to_sec()
 
-        # ---------- BACK / ESCAPE ----------
         if self.state == "BACK":
-            self.back_control(now)
+            self.back_control()
             return
 
         if self.state == "ESCAPE":
-            self.escape_control(now)
+            self.escape_control()
             return
 
-        img = self.msg_to_cv2(msg)
-        if img is None:
-            self.current_lin = 0.0
-            self.current_ang = self.search_spin_speed
-            return
-
-        # ---------- CONE PASS ----------
-        if self.state == "CONE_PASS":
-            if self.detect_cone(img):
-                self.cone_control_lidar()
-            else:
-                self.state = "LANE"
-            return
-
-        # ---------- CONE ENTRY (카메라 트리거) ----------
-        if self.detect_cone(img):
-            self.state = "CONE_PASS"
-            self.cone_control_lidar()
-            return
-
-        # ---------- OBSTACLE ----------
-        if self.front < 0.45:
+        # 장애물 감지
+        if self.front < 0.30:
             self.state = "BACK"
             self.state_start = now
             return
 
-        # ---------- NORMAL LANE ----------
-        self.edge_lane_control(img)
+        frame = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
+        h, w = frame.shape[:2]
+        roi = frame[int(h * 0.55):h, :]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
+        # ========================================================
+        # 라바콘 감지 (항상 체크)
+   
+        lower_r1 = np.array([0, 120, 80])
+        upper_r1 = np.array([10, 255, 255])
+        lower_r2 = np.array([170, 120, 80])
+        upper_r2 = np.array([180, 255, 255])
+
+        red_mask = cv2.bitwise_or(
+            cv2.inRange(hsv, lower_r1, upper_r1),
+            cv2.inRange(hsv, lower_r2, upper_r2)
+        )
+
+        red_contours, _ = cv2.findContours(
+            red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        centers = []
+        for c in red_contours:
+            if cv2.contourArea(c) < 200:
+                continue
+            M = cv2.moments(c)
+            if M["m00"] != 0:
+                centers.append(int(M["m10"] / M["m00"]))
+
+   
+        # 라바콘 주행 (처음~중간)
+        # ========================================================
+        if len(centers) >= 1:
+            self.after_cone = True   # ⭐ 여기서 True로 고정
+
+            if len(centers) >= 2:
+                centers.sort()
+                mid = (centers[0] + centers[-1]) // 2
+            else:
+                mid = centers[0]
+
+            error = mid - (w // 2)
+            twist.linear.x = 0.22
+            twist.angular.z = error / 180.0
+            self.pub.publish(twist)
+            return
+
+        # 라바콘 이후 → 검은색 바닥 ONLY
+        # ========================================================
+        if self.after_cone:
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+            _, binary = cv2.threshold(
+                gray, 0, 255,
+                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+            )
+
+            kernel = np.ones((3, 3), np.uint8)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+            mask = binary > 0
+            col_sum = np.sum(mask, axis=0)
+
+            if np.max(col_sum) < 5:
+                twist.linear.x = self.black_speed
+                twist.angular.z = 0.0
+                self.pub.publish(twist)
+                return
+
+            cand = np.where(col_sum >= np.max(col_sum) * 0.3)[0]
+            cx = np.sum(cand * col_sum[cand]) / np.sum(col_sum[cand])
+
+            error = cx - (w / 2)
+            twist.linear.x = self.black_speed
+            twist.angular.z = -self.k_black * error
+            twist.angular.z = max(min(twist.angular.z, 0.8), -0.8)
+            self.pub.publish(twist)
+            return
+
+        
+        # 라바콘 이전 → 흰색 차선
+        # ========================================================
+        lower_white = np.array([0, 0, 180])
+        upper_white = np.array([180, 40, 255])
+        mask_white = cv2.inRange(hsv, lower_white, upper_white)
+
+        contours, _ = cv2.findContours(
+            mask_white, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if len(contours) == 0:
+            twist.linear.x = 0.12
+            twist.angular.z = 0.0
+            self.pub.publish(twist)
+            return
+
+        c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(c) < self.min_line_area:
+            twist.linear.x = 0.12
+            twist.angular.z = 0.0
+            self.pub.publish(twist)
+            return
+
+        M = cv2.moments(c)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            error = cx - (w // 2)
+            gain = self.base_gain * (1.0 + abs(error) / self.corner_scale)
+            twist.linear.x = 0.22
+            twist.angular.z = max(
+                min(gain * error, self.max_steer),
+                -self.max_steer
+            )
+            self.pub.publish(twist)
+
+    # BACK / ESCAPE
     # ============================================================
-    # BACK / ESCAPE (기존 그대로)
-    # ============================================================
-    def back_control(self, now):
+    def back_control(self):
+        twist = Twist()
+        now = rospy.Time.now().to_sec()
+
         if now - self.state_start < 1.2:
-            self.current_lin = -0.15
-            self.current_ang = 0.0
+            twist.linear.x = -0.24
+            twist.angular.z = 0.0
+            self.pub.publish(twist)
         else:
-            self.escape_angle = self.find_gap_max_forward()
+            self.escape_angle = self.find_gap()
             self.state = "ESCAPE"
             self.state_start = now
 
-    def escape_control(self, now):
-        if now - self.state_start < 1.5:
-            self.current_lin = 0.14
-            self.current_ang = np.clip(self.escape_angle * 1.5, -0.8, 0.8)
+    def escape_control(self):
+        twist = Twist()
+        now = rospy.Time.now().to_sec()
+
+        if now - self.state_start < 1.2:
+            twist.linear.x = 0.20
+            twist.angular.z = self.escape_angle * 1.5
+            self.pub.publish(twist)
         else:
             self.state = "LANE"
 
-    def find_gap_max_forward(self):
+    def find_gap(self):
         if len(self.scan_ranges) == 0:
             return 0.0
 
         raw = np.array(self.scan_ranges)
         ranges = np.concatenate([raw[-60:], raw[:60]])
-        ranges = np.nan_to_num(ranges, nan=0.0, posinf=3.5, neginf=0.0)
+        ranges = np.where((ranges < 0.20) | np.isnan(ranges), 0.0, ranges)
 
-        smoothed = np.convolve(ranges, np.ones(20)/20, mode='same')
-        best_idx = np.argmax(smoothed)
-        angle_deg = best_idx - 60
-        safe = 5 if angle_deg > 0 else -5
-
-        return (angle_deg + safe) * np.pi / 180.0
-
-    # ============================================================
-    # CONE DETECTION (CAMERA)
-    # ============================================================
-    def detect_cone(self, img):
-        h, w = img.shape[:2]
-        roi = img[int(h * 0.55):, :]
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-        mask = cv2.inRange(hsv, np.array([0,120,80]), np.array([10,255,255])) | \
-               cv2.inRange(hsv, np.array([170,120,80]), np.array([180,255,255]))
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        self.red_contours = [c for c in contours if cv2.contourArea(c) > 200]
-
-        return len(self.red_contours) >= 2
-
-    # ============================================================
-    # CONE CONTROL (LIDAR CENTERING)
-    # ============================================================
-    def get_cone_gap_error(self):
-        if len(self.scan_ranges) == 0:
+        idx = np.argmax(ranges)
+        if ranges[idx] < self.robot_width + 0.10:
             return 0.0
 
-        raw = np.array(self.scan_ranges)
-
-        left = raw[30:60]
-        right = raw[-60:-30]
-
-        left = left[np.isfinite(left)]
-        right = right[np.isfinite(right)]
-
-        if len(left) == 0 or len(right) == 0:
-            return 0.0
-
-        L = np.median(left)
-        R = np.median(right)
-
-        return L - R   # 0이면 중앙
-
-    def cone_control_lidar(self):
-        error = self.get_cone_gap_error()
-
-        self.current_lin = self.cone_speed
-        self.current_ang = np.clip(error * 1.2, -0.6, 0.6)
-
-    # ============================================================
-    # EDGE LANE
-    # ============================================================
-    def edge_lane_control(self, img):
-        h, w, _ = img.shape
-        roi = img[int(h * 0.5):, :]
-        gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (5,5), 0)
-        _, binary = cv2.threshold(gray, 0, 255,
-                                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-        col_sum = np.sum(binary > 0, axis=0)
-        if np.max(col_sum) < 5:
-            self.current_lin = 0.0
-            self.current_ang = self.search_spin_speed
-            return
-
-        idx = np.where(col_sum >= max(5, int(np.max(col_sum) * 0.3)))[0]
-        center = np.mean(idx)
-        offset = center - (w / 2.0)
-
-        self.current_lin = self.forward_speed
-        self.current_ang = np.clip(-self.k_angle * offset, -0.8, 0.8)
-
-    # ============================================================
-    # IMAGE CONVERT
-    # ============================================================
-    def msg_to_cv2(self, msg):
-        if self.encoding is None:
-            self.encoding = msg.encoding
-
-        arr = np.frombuffer(msg.data, dtype=np.uint8)
-        img = arr.reshape(msg.height, msg.step // 3, 3)[:, :msg.width]
-
-        if self.encoding == "rgb8":
-            return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        return img
-
-    # ============================================================
-    # SPIN
-    # ============================================================
-    def spin(self):
-        rate = rospy.Rate(20)
-        while not rospy.is_shutdown():
-            self.cmd.linear.x = self.current_lin
-            self.cmd.angular.z = self.current_ang
-            self.pub.publish(self.cmd)
-            rate.sleep()
+        return (idx - 60) * np.pi / 180
 
 
 if __name__ == "__main__":
-    LimoFinalController().spin()
-
+    LineTracerWithObstacleAvoidance()
+    rospy.spin()
 
